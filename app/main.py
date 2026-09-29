@@ -1982,11 +1982,15 @@ async def reset_room(code: str):
 
 @app.websocket("/ws/{code}")
 async def room_ws(websocket: WebSocket, code: str, last_event_id: int = 0):
-    """重连协议：客户端带上已应用的最大事件 ID。
+    """重连协议：客户端带上已应用的最大事件 ID（仅提示，不参与水位裁决）。
 
     码可以是房间码（主持人，全量视野）或组加入码（参与者，按组过滤）。
-    服务端在锁内先登记连接、再发权威快照（快照水位不低于客户端水位），
-    之后的增量事件按递增 ID 广播并按视野过滤；客户端丢弃 id <= 水位的事件，状态不回退。
+    服务端在锁内先登记连接、再发权威快照；快照的 last_event_id 一律以状态锁内
+    读取的当前房间事件水位 MAX(events.id) 为准，绝不被客户端提示值抬高——
+    事件 ID 在全库全局自增，提示值可能来自旧库或其他房间，一旦高于本房间水位，
+    抬高后的快照虽内容正确，浏览器却会持续丢弃快照之后 ID 更小的本房间新事件。
+    快照是全量状态，水位回退（提示值过旧或跨房间）也不影响正确性：客户端以快照
+    整体替换本地状态，之后只应用 id > 快照水位的增量事件，不重复、不回退。
     """
     code = code.upper()
     await websocket.accept()
@@ -1998,9 +2002,9 @@ async def room_ws(websocket: WebSocket, code: str, last_event_id: int = 0):
             return
         hub_key = room["code"]
         hub.add(hub_key, websocket, scope)
-        snapshot = build_snapshot(room, scope)
-        snapshot["last_event_id"] = max(snapshot["last_event_id"], last_event_id)
-        await websocket.send_json(snapshot)
+        # build_snapshot 在同一把锁内以本房间 MAX(events.id) 定水位；
+        # 不与 last_event_id 取 max，防止跨房间/旧库提示值把水位抬到未来。
+        await websocket.send_json(build_snapshot(room, scope))
     try:
         while True:
             await websocket.receive_text()  # 客户端无需上行；仅用于感知断线
@@ -2013,6 +2017,10 @@ async def room_ws(websocket: WebSocket, code: str, last_event_id: int = 0):
 @app.websocket("/ws/observe/{token}")
 async def observe_ws(websocket: WebSocket, token: str, last_event_id: int = 0):
     """观察者实时通道：与参与者同一套「先快照后增量」协议，事件按观察视野过滤。
+
+    快照 last_event_id 与房间连接同口径：只取状态锁内本房间 MAX(events.id)，
+    不被客户端提示的 last_event_id 抬高（旧库/跨房间/被篡改的提示值一律无效）；
+    快照全量替换观察者本地状态，其后的本房间递增事件正常应用。
 
     凭证失效（撤销/到期）时拒绝接入；在线连接由撤销/到期路径主动断开（4403）。
     """
@@ -2029,9 +2037,8 @@ async def observe_ws(websocket: WebSocket, token: str, last_event_id: int = 0):
         scope = observer_scope_from(share)
         hub_key = room["code"]
         hub.add(hub_key, websocket, scope)
-        snapshot = build_snapshot(room, scope)
-        snapshot["last_event_id"] = max(snapshot["last_event_id"], last_event_id)
-        await websocket.send_json(snapshot)
+        # 快照水位以锁内本房间真实水位为准，不与客户端提示值取 max。
+        await websocket.send_json(build_snapshot(room, scope))
     try:
         while True:
             await websocket.receive_text()  # 观察者只读，无上行；仅用于感知断线

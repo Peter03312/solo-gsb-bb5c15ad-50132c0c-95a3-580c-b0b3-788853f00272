@@ -225,6 +225,61 @@ docker compose up --build
     自动刷新，也可点「刷新」手动重取；数据按点击瞬间的事件水位统计，暂停时长不计入。
     参与者与观察席没有该面板，也拿不到分析数据。
 
+## 房间操作 HTTP API 与示例
+
+房间码（创建房间时返回的 6 位码）即主持人凭证：主持人路径前缀
+`/api/rooms/{房间码}`，返回全量主持人快照；参与者用组加入码走 `/api/join/{加入码}`，
+只拿到全员 + 本组的过滤视图。以下示例均可直接用 `curl` 调用（`jq` 可选，仅为可读）：
+
+```bash
+BASE=http://localhost:8000
+
+# 1) 创建房间 → 返回 {code, name}；code 即主持人凭证
+ROOM_CODE=$(curl -s -X POST $BASE/api/rooms -H 'Content-Type: application/json' \
+  -d '{"name":"桌面演练"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["code"])')
+echo "房间码=$ROOM_CODE"
+
+# 2) 主持人读全量快照（房间/时钟/全部组/卡片/回执/答复/投票/锚点 …）
+curl -s $BASE/api/rooms/$ROOM_CODE | python3 -m json.tool
+
+# 3) 新增参与组（至多 8 个）→ 返回 {id,name,join_code}；join_code 发给该组
+JOIN_CODE=$(curl -s -X POST $BASE/api/rooms/$ROOM_CODE/groups \
+  -H 'Content-Type: application/json' -d '{"name":"红队"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["join_code"])')
+
+# 4) 参与者凭加入码读本组快照（不含房间码、他组卡片与未揭示卡片）
+curl -s $BASE/api/join/$JOIN_CODE | python3 -m json.tool
+
+# 5) 暂停状态下添加卡片（全员；定向卡加 "group_id": 组id；门槛可选）
+curl -s -X POST $BASE/api/rooms/$ROOM_CODE/cards \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"机房告警","content":"核心交换机流量异常","trigger_seconds":30}'
+
+# 6) 时钟：开始 / 暂停 / 继续 / 重置（重置前须先暂停）
+curl -s -X POST $BASE/api/rooms/$ROOM_CODE/start
+curl -s -X POST $BASE/api/rooms/$ROOM_CODE/pause
+curl -s -X POST $BASE/api/rooms/$ROOM_CODE/resume
+curl -s -X POST $BASE/api/rooms/$ROOM_CODE/reset
+
+# 7) 参与者对已揭示卡片标记回执（撤销用 DELETE 同路径）
+curl -s -X POST $BASE/api/join/$JOIN_CODE/cards/1/receipt
+```
+
+实时通道在 REST 快照之外另走 WebSocket，URL 仍以同一套凭证鉴权，消息结构
+（`snapshot` / `event` / `error`）保持不变：
+
+```bash
+# 主持人或参与者（code = 房间码或组加入码）；last_event_id 仅为重连提示
+wscat -c "ws://localhost:8000/ws/$ROOM_CODE?last_event_id=0"
+
+# 观察者（先用 POST /api/rooms/{房间码}/shares 换 token；失效时以 4403 关闭）
+wscat -c "ws://localhost:8000/ws/observe/$OBSERVE_TOKEN?last_event_id=0"
+```
+
+无论 `last_event_id` 传什么（缺省 `0`、普通重连带当前水位，或误带旧库/其他房间的
+高水位），服务端下发的快照水位始终是该房间锁内真实 `MAX(events.id)`；快照之后的
+本房间新事件按全局递增 ID 正常推送，客户端不会因提示值虚高而丢弃新事件。
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -239,9 +294,14 @@ DATABASE_PATH=./data/inject.db uvicorn app.main:app --reload --port 8000
   时钟动作）都会落库为**单调递增事件**并广播。
 - 房间码是主持人凭证（全量视野）；组加入码是参与者凭证（仅全员 + 本组视野）。
   快照与每条增量事件都在服务端按视野过滤，参与者不会收到他组卡片，也拿不到房间码。
-- WebSocket 连接建立时客户端携带 `last_event_id`；服务端在锁内先下发权威快照
-  （含事件水位），再广播后续增量事件；客户端丢弃 `id <= 水位` 的事件，因此刷新、
-  重连后状态不回退，也不会混入他组内容。
+- WebSocket 连接建立时客户端可携带 `last_event_id`（自己已应用的最大事件 ID，**仅作
+  重连提示，服务端不据它裁决水位**）；服务端在锁内先下发权威快照，快照的
+  `last_event_id` 一律取**状态锁内当前房间**的事件水位 `MAX(events.id)`，**绝不被
+  客户端提示值抬高**——事件 ID 在全库全局自增，提示值可能来自旧库或其他房间，一旦
+  高于本房间水位，快照内容虽正确，浏览器却会按 `id <= 水位` 规则持续丢弃本房间的
+  新事件。快照是全量状态，提示值过旧或跨房间（水位回退）也不影响正确性：客户端以
+  快照整体替换本地状态，再只应用 `id > 快照水位` 的后续递增事件，因此刷新、普通
+  重连后状态不回退、不重复，也不会混入他组内容。
 - 参与组被删除后其加入码立即失效，仍在连接的该组参与者会被服务端主动断开。
 - 观察凭证是第三种连接凭证（随机 128 位，与房间码/加入码不同命名空间）：观察者
   连接 `/ws/observe/{token}`，快照与增量按「已揭示 ∩（全员 ∪ 所选组）」过滤，
