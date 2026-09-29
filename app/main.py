@@ -1985,8 +1985,11 @@ async def room_ws(websocket: WebSocket, code: str, last_event_id: int = 0):
     """重连协议：客户端带上已应用的最大事件 ID。
 
     码可以是房间码（主持人，全量视野）或组加入码（参与者，按组过滤）。
-    服务端在锁内先登记连接、再发权威快照（快照水位不低于客户端水位），
-    之后的增量事件按递增 ID 广播并按视野过滤；客户端丢弃 id <= 水位的事件，状态不回退。
+    服务端在锁内先登记连接、再发权威快照：快照水位一律取锁内读到的
+    「本房间」MAX(events.id)，绝不被客户端提示值抬高——该值可能来自旧库
+    或其他房间（事件 id 是全库自增，跨房间不可比），一旦高于本房间水位，
+    浏览器会持续丢弃此后的新事件。快照已完整包含水位及之前的全部状态，
+    之后的增量事件 id 必然更大，普通重连仍不重复、不回退。
     """
     code = code.upper()
     await websocket.accept()
@@ -1998,9 +2001,8 @@ async def room_ws(websocket: WebSocket, code: str, last_event_id: int = 0):
             return
         hub_key = room["code"]
         hub.add(hub_key, websocket, scope)
-        snapshot = build_snapshot(room, scope)
-        snapshot["last_event_id"] = max(snapshot["last_event_id"], last_event_id)
-        await websocket.send_json(snapshot)
+        # 快照水位以锁内读取的当前房间水位为准，不采纳客户端 last_event_id
+        await websocket.send_json(build_snapshot(room, scope))
     try:
         while True:
             await websocket.receive_text()  # 客户端无需上行；仅用于感知断线
@@ -2014,6 +2016,8 @@ async def room_ws(websocket: WebSocket, code: str, last_event_id: int = 0):
 async def observe_ws(websocket: WebSocket, token: str, last_event_id: int = 0):
     """观察者实时通道：与参与者同一套「先快照后增量」协议，事件按观察视野过滤。
 
+    快照水位同样只认锁内读到的当前房间事件水位，不受客户端 last_event_id
+    （可能来自旧库或别的房间）抬高；快照之后的新事件按实际递增 id 正常下发。
     凭证失效（撤销/到期）时拒绝接入；在线连接由撤销/到期路径主动断开（4403）。
     """
     await websocket.accept()
@@ -2029,9 +2033,8 @@ async def observe_ws(websocket: WebSocket, token: str, last_event_id: int = 0):
         scope = observer_scope_from(share)
         hub_key = room["code"]
         hub.add(hub_key, websocket, scope)
-        snapshot = build_snapshot(room, scope)
-        snapshot["last_event_id"] = max(snapshot["last_event_id"], last_event_id)
-        await websocket.send_json(snapshot)
+        # 快照水位以锁内读取的当前房间水位为准，不采纳客户端 last_event_id
+        await websocket.send_json(build_snapshot(room, scope))
     try:
         while True:
             await websocket.receive_text()  # 观察者只读，无上行；仅用于感知断线

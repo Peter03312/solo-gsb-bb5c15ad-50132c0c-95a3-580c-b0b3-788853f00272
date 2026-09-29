@@ -240,8 +240,12 @@ DATABASE_PATH=./data/inject.db uvicorn app.main:app --reload --port 8000
 - 房间码是主持人凭证（全量视野）；组加入码是参与者凭证（仅全员 + 本组视野）。
   快照与每条增量事件都在服务端按视野过滤，参与者不会收到他组卡片，也拿不到房间码。
 - WebSocket 连接建立时客户端携带 `last_event_id`；服务端在锁内先下发权威快照
-  （含事件水位），再广播后续增量事件；客户端丢弃 `id <= 水位` 的事件，因此刷新、
-  重连后状态不回退，也不会混入他组内容。
+  （含事件水位），再广播后续增量事件。**快照 `last_event_id` 一律以服务端在
+  `state_lock` 内读到的「当前房间」事件水位（`MAX(events.id)`）为准，不会被
+  客户端提示值抬高**——该值可能来自旧库或其他房间（事件 id 全库自增、跨房间
+  不可比），一旦高于本房间水位，浏览器会持续丢弃此后的新事件。快照已完整
+  包含水位及之前的全部状态，之后的增量事件 id 必然更大，因此刷新、重连后
+  状态不回退、不重复，也不会混入他组内容；客户端仍丢弃 `id <= 快照水位` 的事件。
 - 参与组被删除后其加入码立即失效，仍在连接的该组参与者会被服务端主动断开。
 - 观察凭证是第三种连接凭证（随机 128 位，与房间码/加入码不同命名空间）：观察者
   连接 `/ws/observe/{token}`，快照与增量按「已揭示 ∩（全员 ∪ 所选组）」过滤，
@@ -255,6 +259,76 @@ DATABASE_PATH=./data/inject.db uvicorn app.main:app --reload --port 8000
   冻结——重启后（暂停期间）提交的回执/答复挂靠冻结虚拟时间，**不会把停机与暂停的墙钟
   时长计成响应时延**，离线回放也不会错置事件时间；继续运行后从冻结值累计，跨重置仍按
   轮次隔离。原本就待机/已暂停的房间不补事件，重复初始化也不会重复追加。
+
+## 房间操作 API 与调用示例
+
+所有写接口都在同一把 `state_lock` 内串行处理；**房间码就是主持人凭证**，
+**组加入码是参与者凭证**，写错凭证一律 `404`（不泄露房间是否存在）。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/api/rooms` | 创建房间：`{name?}`；`201` 返回 `{code, name}`，房间码即主持人凭证 |
+| `GET` | `/api/rooms/{房间码}` | 主持人快照（全量视野，含房间码、全部组与卡片） |
+| `GET` | `/api/join/{组加入码}` | 参与者快照（仅全员 + 本组，不含房间码与组加入码） |
+| `POST` | `/api/rooms/{房间码}/groups` | 建参与组：`{name}`（2～8 个）；`201` 返回 `{id, name, join_code}` |
+| `PATCH` | `/api/rooms/{房间码}/groups/{id}` | 组改名：`{name}` |
+| `DELETE` | `/api/rooms/{房间码}/groups/{id}` | 删除组：被卡片引用返回 `409`；在线成员被主动断开（4404） |
+| `POST` | `/api/rooms/{房间码}/cards` | 编排卡片：`{title, trigger_seconds, content?, group_id?, depends_on_card_id?, gate_timeout_seconds?}`；`201` 返回卡片对象 |
+| `DELETE` | `/api/rooms/{房间码}/cards/{card_id}` | 删除卡片；被其他卡片依赖返回 `409` |
+| `POST` | `/api/rooms/{房间码}/start` | 开始演练（仅 `idle`），广播 `clock` 事件 |
+| `POST` | `/api/rooms/{房间码}/pause` | 暂停（仅 `running`），冻结虚拟时钟 |
+| `POST` | `/api/rooms/{房间码}/resume` | 继续（仅 `paused`） |
+| `POST` | `/api/rooms/{房间码}/reset` | 重置（须先暂停）：时钟归零、收回揭示，保留组/卡片/门槛编排 |
+| `WS` | `/ws/{房间码或组加入码}?last_event_id=` | 主持人/参与者实时通道：先快照后增量，按视野过滤；凭证无效以 4404 关闭 |
+
+### 一轮房间操作示例（curl）
+
+```bash
+BASE=http://localhost:8000
+
+# 1) 主持人建房
+ROOM_CODE=$(curl -s -X POST $BASE/api/rooms \
+  -H 'Content-Type: application/json' -d '{"name":"夜间切流演练"}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["code"])')
+echo "房间码：$ROOM_CODE"
+
+# 2) 建两个参与组，记下各自的 6 位加入码
+JOIN_RED=$(curl -s -X POST $BASE/api/rooms/$ROOM_CODE/groups \
+  -H 'Content-Type: application/json' -d '{"name":"红队"}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["join_code"])')
+JOIN_BLUE=$(curl -s -X POST $BASE/api/rooms/$ROOM_CODE/groups \
+  -H 'Content-Type: application/json' -d '{"name":"蓝队"}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["join_code"])')
+
+# 3) 编排卡片：一张全员卡（T+10s）、一张定向红队卡（T+20s）
+curl -s -X POST $BASE/api/rooms/$ROOM_CODE/cards \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"上游告警","content":"流量异常上涨","trigger_seconds":10}'
+GID=$(curl -s $BASE/api/rooms/$ROOM_CODE \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["groups"][0]["id"])')
+curl -s -X POST $BASE/api/rooms/$ROOM_CODE/cards \
+  -H 'Content-Type: application/json' \
+  -d "{\"title\":\"红队处置\",\"trigger_seconds\":20,\"group_id\":$GID}"
+
+# 4) 开始 → 暂停 → 继续 →（暂停后）重置
+curl -s -X POST $BASE/api/rooms/$ROOM_CODE/start
+curl -s -X POST $BASE/api/rooms/$ROOM_CODE/pause
+curl -s -X POST $BASE/api/rooms/$ROOM_CODE/resume
+curl -s -X POST $BASE/api/rooms/$ROOM_CODE/pause   # 运行中不可直接 reset
+curl -s -X POST $BASE/api/rooms/$ROOM_CODE/reset
+
+# 5) 两种视野的 REST 快照（同源于 WebSocket 重连快照）
+curl -s $BASE/api/rooms/$ROOM_CODE       # 主持人：全部
+curl -s $BASE/api/join/$JOIN_RED         # 红队：全员卡 + 红队卡
+```
+
+- 实时通道（任何 WebSocket 客户端均可）：主持人
+  `ws://localhost:8000/ws/$ROOM_CODE?last_event_id=0`，参与者
+  `ws://localhost:8000/ws/$JOIN_RED?last_event_id=0`，观察者
+  `ws://localhost:8000/ws/observe/{token}?last_event_id=0`。服务端**先推
+  snapshot 再推 event**；断线重连时把本地已应用的最大事件 id 带上即可，
+  快照水位始终由服务端按当前房间水位裁定，传错（过大、来自旧库或他房间）
+  也不会导致新事件被丢弃。
 
 ## 回执 API 与事件
 
